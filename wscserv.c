@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <openssl/sha.h>
 #include <stdint.h>
+#include <errno.h>
 #include <endian.h>
-#define MAX_CLIENTS 30
 #define MAX_NAME 256
 #define MAX_CHAT_ROOMS 10
 #define MAX_CHAT_MEMBERS 10
@@ -21,6 +21,8 @@ typedef struct {
     int theyre_logged_in;
 } user_t;
 
+
+// https://stackoverflow.com/questions/342409/how-do-i-base64-encode-decode-in-c
 static char encoding_table[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
                                 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
                                 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X',
@@ -147,7 +149,7 @@ uint64_t websocket_recv(int fd, char *buf, uint64_t length) {
 
 
 
-void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clients[]) {
+void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clients[], uintmax_t max_clients) {
     int newfd = accept(fd, (struct sockaddr *) clientp, cp);
     printf("Connection from %s\n", inet_ntoa(clientp->sin_addr));
     char buf[BUFSIZ + strlen("258EAFA5-E914-47DA-95CA-C5AB0DC85B11") + 1];
@@ -198,7 +200,7 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     free(the_base64_key);
     printf("Here's the response!\n%s\n", response);
     write(newfd, response, strlen(response));
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < max_clients; i++) {
         if (clients[i].their_sock < 0) {
             clients[i].their_sock = newfd;
             return;
@@ -212,8 +214,8 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
 void log_someone_out(user_t *the_user, int nice);
 void parse_cmd(user_t clients[], user_t *the_user, char *cmd, char *args);
 void reset_user_t(user_t *the_user);
-void wall(user_t clients[], char *msg, uint64_t length) {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+void wall(user_t clients[], char *msg, uint64_t length, uintmax_t max_clients) {
+    for (int i = 0; i < max_clients; i++) {
         if (clients[i].theyre_logged_in) {
             if (clients[i].their_sock == 0) {
                 write(1, msg, length);
@@ -224,7 +226,7 @@ void wall(user_t clients[], char *msg, uint64_t length) {
     }
 }
 
-void on_data(user_t clients[], user_t *the_user) {
+void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     char buf[BUFSIZ];
     uint64_t retval;
     printf("from %s %d %d\n", the_user->their_name, the_user->their_sock, the_user->theyre_logged_in);
@@ -247,7 +249,7 @@ void on_data(user_t clients[], user_t *the_user) {
         strncat(the_message_with_their_name, buf, retval);
         printf("%.*s\n" , strlen(the_user->their_name) + 2 + retval, the_message_with_their_name);
         printf("This is the sum: %llu\n", strlen(the_user->their_name) + 2 + retval);
-        wall(clients, the_message_with_their_name, strlen(the_user->their_name) + 2 + retval);
+        wall(clients, the_message_with_their_name, strlen(the_user->their_name) + 2 + retval, max_clients);
     } else {
         retval = websocket_recv(the_user->their_sock, the_user->their_name, MAX_NAME);
         printf("Here's how many bytes they sent if they're not logged in: %llu\n", retval);
@@ -281,10 +283,20 @@ void reset_user_t(user_t *the_user) {
     the_user->theyre_logged_in = 0;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Max clients not specified\n");
+        return -1;
+    }
+    uintmax_t max_clients = strtoumax(argv[1], NULL, 0);
+    printf("max_clients: %ju\n");
+    if (max_clients == 0 || errno != 0) {
+        perror("Invalid amount of clients");
+        return -1;
+    }
     int fd = socket(AF_INET, SOCK_STREAM, 0), c = sizeof(struct sockaddr_in), highestfd = fd;
-    user_t clients[MAX_CLIENTS];
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    user_t clients[max_clients];
+    for (int i = 0; i < max_clients; i++) {
         reset_user_t(&clients[i]);
     }
     strcpy(clients[0].their_name, "Server");
@@ -303,10 +315,12 @@ int main() {
         FD_ZERO(&readfds);
         FD_SET(fd, &readfds);
         highestfd = fd;
-        for (int i = 0; i < MAX_CLIENTS; i++) {
+        uintmax_t user_count = 0;
+        for (int i = 0; i < max_clients; i++) {
             printf("%d: their_sock: %d, their_name: %s, theyre_logged_in: %d\n", i, clients[i].their_sock, clients[i].their_name, clients[i].theyre_logged_in);
             if (clients[i].their_sock > -1) {
                 FD_SET(clients[i].their_sock, &readfds);
+                user_count++;
             }
 
             if (clients[i].their_sock > highestfd) {
@@ -314,14 +328,17 @@ int main() {
             }
         }
 
+        printf(user_count == 1 ? "%ju user" : "%ju users", user_count); 
+        printf(" out of %ju\n", max_clients);
+
         select(highestfd + 1, &readfds, NULL, NULL, NULL);
         if (FD_ISSET(fd, &readfds)) {
-            on_connect(fd, (struct sockaddr_in *) &client, (socklen_t *) &c, clients);
+            on_connect(fd, (struct sockaddr_in *) &client, (socklen_t *) &c, clients, max_clients);
             
         }
-        for (int i = 0; i < MAX_CLIENTS; i++) {
+        for (int i = 0; i < max_clients; i++) {
             if (FD_ISSET(clients[i].their_sock, &readfds)) {
-                on_data(clients, &clients[i]);
+                on_data(clients, &clients[i], max_clients);
             }
         }
         t1.tv_sec = 0;
