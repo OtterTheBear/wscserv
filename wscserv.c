@@ -11,9 +11,8 @@
 #include <stdint.h>
 #include <errno.h>
 #include <endian.h>
+#include <signal.h>
 #define MAX_NAME 256
-#define MAX_CHAT_ROOMS 10
-#define MAX_CHAT_MEMBERS 10
 
 typedef struct {
     int their_sock;
@@ -64,7 +63,7 @@ char *base64_encode(const unsigned char *data,
     return encoded_data;
 }
 
-uint64_t websocket_send(int fd, char *buf, uint64_t length, char opcode) {
+int64_t websocket_send(int fd, char *buf, int64_t length, char opcode) {
     char sendbuf[10];
     sendbuf[0] = opcode;
     int header_bytes = 0;
@@ -86,41 +85,45 @@ uint64_t websocket_send(int fd, char *buf, uint64_t length, char opcode) {
         }
     }
     
-    int sendbuf_retval = write(fd, sendbuf, header_bytes);
+    ssize_t sendbuf_retval = write(fd, sendbuf, header_bytes);
     if (sendbuf_retval < header_bytes) {
         close(fd);
         return 0;
     }
     
-    int retval = 0;
-    retval = write(fd, buf, length);
-    if (retval < length) {
-        close(fd);
-        return 0;
+    ssize_t retval = write(fd, buf, length);
+    if (retval < 0) {
+        perror("websocket_send: write");
     }
     return retval;
 }
 
-uint64_t websocket_recv(int fd, char *buf, uint64_t length) {
+int64_t websocket_recv(int fd, char *buf, int64_t length) {
     unsigned char lengthbuf[14];
-    if (read(fd, lengthbuf, 1) == 0) {
+    ssize_t retval = read(fd, lengthbuf, 2); 
+    if (retval < 0) {
+        perror("read");
+        return -1;
+    }
+    
+    if (retval == 0) {
         return 0;
     }
+
     char opcode = lengthbuf[0] & 0xf;
     printf("Opcode: %.2x\n", opcode);
     if (opcode == 0x8) {
         websocket_send(fd, "", 0, 0x88);
         return 0;
     }
-    if ((opcode < 0x1) || (opcode > 0x1 && opcode < 0x9) || (opcode > 0xA)) {
+    if ((opcode < 0x1) || (opcode > 0x1 && opcode < 0x9) || (opcode > 0xA) || !(lengthbuf[1] & 0x80)) {
         return 0;
     } else {
-        read(fd, lengthbuf + 1, 1);
-        uint64_t sent_length = (uint64_t) lengthbuf[1] & 0x7F;
+        int64_t sent_length = (int64_t) lengthbuf[1] & 0x7F;
         printf("this is the first byte of the sent length: %llu\n", sent_length);
         if (sent_length == 126) {
             read(fd, lengthbuf + 2, 2);
-            sent_length = ((uint64_t) (lengthbuf[2] * 256)) + ((uint64_t) lengthbuf[3]);
+            sent_length = ((int64_t) (lengthbuf[2] * 256)) + ((int64_t) lengthbuf[3]);
             printf("yay!!! more bytes of the sent length %llu\n", sent_length);
         } else if (sent_length == 127) {
             read(fd, lengthbuf + 2, 8);
@@ -128,18 +131,18 @@ uint64_t websocket_recv(int fd, char *buf, uint64_t length) {
             int i = 2;
             int j = 64;
             while (i < 10) {
-                sent_length += (uint64_t) lengthbuf[i] << j;
+                sent_length += (int64_t) lengthbuf[i] << j;
                 i++;
                 j -= 8;
             }
         }
         char mask[4];
         read(fd, mask, 4);
-        uint64_t i = 0;
+        int64_t i = 0;
         for (; (i < length) && (i < sent_length) && (read(fd, buf + i, 1)) > 0; i++) {
             buf[i] ^= mask[i % 4];
         }
-        printf("i: %llu\n", i);
+        printf("i: %lld\n", i);
         return i;
     }
 }
@@ -158,15 +161,19 @@ void log_someone_out(user_t *the_user) { // reset the values of a user_t so onco
 
 void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clients[], uintmax_t max_clients) {
     int newfd = accept(fd, (struct sockaddr *) clientp, cp);
-    printf("Connection from %s\n", inet_ntoa(clientp->sin_addr));
-    char buf[BUFSIZ + strlen("258EAFA5-E914-47DA-95CA-C5AB0DC85B11") + 1];
-    int retval;
-    printf("This many bytes were read: %d\n", retval = read(newfd, buf, BUFSIZ));
+    if (newfd < 0) {
+        return;
+    }
+    time_t now = time(NULL);
+    printf("\nConnection from %s at %s", inet_ntoa(clientp->sin_addr), ctime(&now));
+    char *magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char buf[BUFSIZ + strlen(magic_string) + 1];
+    ssize_t retval;
+    printf("This many bytes were read: %zd\n", retval = read(newfd, buf, BUFSIZ));
     if (retval < 0) {
         perror("Invalid read");
         return;
     }
-    printf("%.*s", retval, buf);
     buf[retval + 1] = '\0';
     char *key = strstr(buf, "Sec-WebSocket-Key: ");
     char *closemsg = "the key isn't in the request";
@@ -195,17 +202,22 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     the_new_line_in_key[0] = '\0';    
     memmove(buf, key + 19, strlen(key) - 18);
 
-    strcat(buf, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    strcat(buf, magic_string);
     unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(buf, strlen(buf), hash);
+    SHA1((unsigned char *) buf, strlen(buf), hash);
     size_t output_length;
     char *the_base64_key = base64_encode(hash, SHA_DIGEST_LENGTH, &output_length);
+
+    if (the_base64_key == NULL) {
+        printf("Base64-encoded key was null\n");
+        close(newfd);
+        return;
+    }
 
     char response[1004 + output_length];
     strcpy(response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
     strcat(strcat(response, the_base64_key), "\r\n\r\n");
     free(the_base64_key);
-    printf("Here's the response!\n%s\n", response);
     write(newfd, response, strlen(response));
     for (int i = 0; i < max_clients; i++) {
         if (clients[i].their_sock < 0) {
@@ -219,13 +231,16 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     
 }
 
-void wall(user_t clients[], char *msg, uint64_t length, uintmax_t max_clients) {
+void wall(user_t clients[], char *msg, int64_t length, uintmax_t max_clients) {
     for (int i = 0; i < max_clients; i++) {
         if (clients[i].theyre_logged_in) {
             if (clients[i].their_sock == 0) {
-                write(1, msg, length);
+                printf("what\n");
+                printf("%.*s\n", length > 128 ? 128 : (int) length, msg);
             } else if (clients[i].their_sock > 0) {
-                websocket_send(clients[i].their_sock, msg, length, 0x81);
+                if (websocket_send(clients[i].their_sock, msg, length, 0x81) < 0) {
+                    log_someone_out(&clients[i]);
+                }
             }
         }
     }
@@ -233,30 +248,30 @@ void wall(user_t clients[], char *msg, uint64_t length, uintmax_t max_clients) {
 
 void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     char buf[BUFSIZ];
-    uint64_t retval;
-    printf("from %s, socket: %d, logged in?: %d\n", the_user->their_name, the_user->their_sock, the_user->theyre_logged_in);
+    int64_t retval;
+    printf("\nfrom %s, socket: %d, logged in?: %d\n", the_user->their_name, the_user->their_sock, the_user->theyre_logged_in);
     if (the_user->theyre_logged_in) {
         if (the_user->their_sock == 0) {
             retval = read(the_user->their_sock, buf, BUFSIZ);
         } else if (the_user->their_sock > 0) {
             retval = websocket_recv(the_user->their_sock, buf, BUFSIZ);
         }
-        printf("This many bytes were recived: %llu\n", retval);
+        printf("This many bytes were received: %lld\n", retval);
         if (retval < 1) {
             printf("retval < 1, logging them out\n");
             log_someone_out(the_user);
             return;
         }
         
-        char the_message_with_their_name[strlen(the_user->their_name) + 2 + retval];
-        strcpy(the_message_with_their_name, the_user->their_name);
-        strcat(the_message_with_their_name, ": " );
+        char the_message_with_their_name[strlen(the_user->their_name) + 2 + retval + 1]; // name length + ": " + sent length + null
+        strncpy(the_message_with_their_name, the_user->their_name, strlen(the_user->their_name));
+        the_message_with_their_name[strlen(the_user->their_name)] = '\0';
+        strcat(the_message_with_their_name, ": ");
         strncat(the_message_with_their_name, buf, retval);
-        printf("%.*s\n" , strlen(the_user->their_name) + 2 + retval, the_message_with_their_name);
         printf("This is the sum: %llu\n", strlen(the_user->their_name) + 2 + retval);
         wall(clients, the_message_with_their_name, strlen(the_user->their_name) + 2 + retval, max_clients);
     } else {
-        retval = websocket_recv(the_user->their_sock, the_user->their_name, MAX_NAME);
+        retval = websocket_recv(the_user->their_sock, the_user->their_name, MAX_NAME - 1);
         printf("Here's how many bytes they sent if they're not logged in: %llu\n", retval);
         if (retval <= 0) {
             printf("logging them out\n");
@@ -278,7 +293,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     uintmax_t max_clients = strtoumax(argv[1], NULL, 0);
-    printf("max_clients: %ju\n");
+    printf("max_clients: %ju\n", max_clients);
     if (max_clients == 0 || errno != 0) {
         perror("Invalid amount of clients");
         return -1;
@@ -295,9 +310,22 @@ int main(int argc, char *argv[]) {
         port = port_argument;
     }
     
+    struct sigaction action;
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    if (sigaction(SIGPIPE, &action, NULL) < 0) {
+        perror("sigaction");
+        return -1;
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0), c = sizeof(struct sockaddr_in), highestfd = fd;
+    if (fd < 0) {
+        perror("socket failed");
+        return -1;
+    }
     user_t clients[max_clients];
-    for (int i = 0; i < max_clients; i++) {
+    for (uintmax_t i = 0; i < max_clients; i++) {
         reset_user_t(&clients[i]);
     }
     strcpy(clients[0].their_name, "Server");
@@ -313,7 +341,10 @@ int main(int argc, char *argv[]) {
     serv.sin_family = AF_INET;
     serv.sin_addr.s_addr = inet_addr("0.0.0.0");
     serv.sin_port = htons(port);
-    bind(fd, (struct sockaddr *) &serv, sizeof(serv));
+    if (bind(fd, (struct sockaddr *) &serv, sizeof(serv)) == -1) {
+        perror("bind failed");
+        return -1;
+    }
     listen(fd, 3);
     while (1) {
         FD_ZERO(&readfds);
