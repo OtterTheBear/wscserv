@@ -25,6 +25,7 @@ typedef struct {
 typedef struct {
     int status;
     size_t length;
+    size_t payload_length;
     char mask[4];
     char *start;
 } websocket_res_t;
@@ -112,23 +113,22 @@ void unmask(char *buf, size_t length, char *mask) {
     }
 }
 
-websocket_res_t websocket_analyze(char *buf, size_t length, size_t *buf_pos) { // length <= max_length
+websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_length
     /* WebSocket frame types:
      * opcode (1), length (1), mask (4), message (length)
      * opcode (1), length indicator (1, == 126), length (2), mask (4), message (length)
      * opcode (1), length indicator (1, == 127), length (8, <= INT64_MAX), mask (4), message (length) */
     printf("length: %zu\n", length);
-    getchar();
     printf("BUF\n");
     for (size_t i = 0; i < length; i++) {
         printf("%.2hhx ", buf[i]);
     }
     printf("\nEND BUF\n");
     websocket_res_t response;
+    response.status = 0;
     if (length < 6) {
-        response.status = 0;
+        response.length = length;
         printf("status 0: incomplete header (length == %zu)\n", length);
-        *buf_pos = length;
         return response;
     }
 
@@ -146,8 +146,8 @@ websocket_res_t websocket_analyze(char *buf, size_t length, size_t *buf_pos) { /
         next = 2;
     } else if (length_indicator == 126) {
         if (length < 8) { // opcode(1) + length indicator(1) + length(2) + mask(4) = 8
-            *buf_pos = length;
             response.status = 0;
+            response.length = length;
             printf("status 0: incomplete 16-bit header\n");
             return response;
         }
@@ -157,8 +157,8 @@ websocket_res_t websocket_analyze(char *buf, size_t length, size_t *buf_pos) { /
         next = 4;
     } else if (length_indicator == 127) {
         if (length < 2 + sizeof (int64_t) + 4) {
-            *buf_pos = length;
             response.status = 0;
+            response.length = length;
             printf("status 0: incomplete 64-bit header\n");
             return response;
         }
@@ -172,7 +172,6 @@ websocket_res_t websocket_analyze(char *buf, size_t length, size_t *buf_pos) { /
         next = 10;
     } else {
         response.status = -1;
-        *buf_pos = 0;
         printf("Invalid length indicator\n");
         return response;
     }
@@ -180,23 +179,21 @@ websocket_res_t websocket_analyze(char *buf, size_t length, size_t *buf_pos) { /
     if (sent_length + next + 4 > BUFSIZ) {
         printf("sent_length + next + 4 > BUFSIZ\n");
         response.status = -1;
-        *buf_pos = 0;
         return response;
     }
 
-    if (sent_length > length) {
+    if (sent_length > length - next - 4) { // TODO
         response.status = 0;
-        *buf_pos = length;
         printf("status 0: sent_length > length\n");
         return response;
     }
 
     char *mask;
     mask = buf + next;
-    response.length = sent_length;
+    response.length = next + 4 + sent_length;
+    response.payload_length = sent_length;
     response.status = 1;
     response.start = mask + 4;
-    *buf_pos = 0;
     unmask(response.start, response.length, mask);
     return response;
 }
@@ -329,53 +326,40 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     retval = read(the_user->their_sock, the_user->buf + the_user->buf_pos, BUFSIZ - the_user->buf_pos);
     printf("This many bytes were received: %zd\n", retval);
     
-    
+    if (retval < 1) {
+        printf("retval < 1, logging them out\n");
+        perror("read");
+        log_someone_out(the_user);
+        return;
+    }
     
     /*for (size_t i = 0; i < retval; i++) {
         printf("char of name: %.2hhx\n", (unsigned char) the_user->buf[i]); 
     }*/
-    
-        
-    while (1) {
-        printf("retval: %zd\n", retval);
-        if (retval < 1) {
-            printf("retval < 1, logging them out\n");
-            perror("read");
-            log_someone_out(the_user);
-            return;
-        }
-        response = websocket_analyze(the_user->buf, retval, &(the_user->buf_pos));
-        printf("response status: %d\n", response.status);
-        printf("response length: %zu\n", response.length);
-        if (response.status == -1) {
-            log_someone_out(the_user);
-            return;
-        } else if (response.status == 0) {
-            return;
-        }
-        if (the_user->theyre_logged_in) {
-            wall_w_name(clients, response.start, response.length, max_clients, *the_user);
-            printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.length);
-        } else {
-            printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
-
-            strncpy(the_user->their_name, response.start, response.length);
-            the_user->their_name[response.length] = '\0';
-            
-            the_user->theyre_logged_in = 1;
-        }
-        size_t totlength = response.start - the_user->buf + response.length;
-        printf("strange? %zu\n", BUFSIZ - (response.start - the_user->buf + response.length));
-        printf("totlength: %zu\n", totlength);
-        if (totlength < BUFSIZ) {
-            memmove(the_user->buf, response.start + response.length, BUFSIZ - totlength);
-            printf("A\n");
-        } else {
-            printf("B\n");
-            return;
-        }
-        retval -= response.start + response.length - the_user->buf - the_user->buf_pos;
+    the_user->buf_pos += retval;
+    response = websocket_analyze(the_user->buf, the_user->buf_pos);
+    printf("response status: %d\n", response.status);
+    printf("response length: %zu\n", response.length);
+    if (response.status == -1) {
+        log_someone_out(the_user);
+        return;
+    } else if (response.status == 0) {
+        return;
     }
+    if (the_user->theyre_logged_in) {
+        wall_w_name(clients, response.start, response.length, max_clients, *the_user);
+        printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
+        the_user->buf_pos = 0;
+    } else {
+        printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
+
+        strncpy(the_user->their_name, response.start, response.payload_length);
+        the_user->their_name[response.length] = '\0';
+        
+        the_user->theyre_logged_in = 1;
+        the_user->buf_pos = 0;
+    }
+    return;
 }
 
 
