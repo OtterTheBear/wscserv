@@ -51,7 +51,7 @@ char *base64_encode(const unsigned char *data,
     char *encoded_data = malloc(*output_length + 1);
     encoded_data[*output_length] = '\0';
     if (encoded_data == NULL) return NULL;
-    for (int i = 0, j = 0; i < input_length;) {
+    for (size_t i = 0, j = 0; i < input_length;) {
 
         uint32_t octet_a = i < input_length ? (unsigned char)data[i++] : 0;
         uint32_t octet_b = i < input_length ? (unsigned char)data[i++] : 0;
@@ -120,9 +120,13 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
      * opcode (1), length indicator (1, == 127), length (8, <= INT64_MAX), mask (4), message (length) */
     printf("length: %zu\n", length);
     printf("BUF\n");
+    size_t print_amount = length > 256 ? 256 : length;
     for (size_t i = 0; i < length; i++) {
         printf("%.2hhx ", buf[i]);
     }
+   /* if (length > print_amount) {
+        printf(" clipped\n");
+    }*/
     printf("\nEND BUF\n");
     websocket_res_t response;
     response.status = 0;
@@ -274,7 +278,7 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     strcat(strcat(response, the_base64_key), "\r\n\r\n");
     free(the_base64_key);
     write(newfd, response, strlen(response));
-    for (int i = 0; i < max_clients; i++) {
+    for (uintmax_t i = 0; i < max_clients; i++) {
         if (clients[i].their_sock < 0) {
             clients[i].their_sock = newfd;
             return;
@@ -323,6 +327,7 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
         return;
     }
     printf("buf_pos: %zu\n", the_user->buf_pos);
+   
     retval = read(the_user->their_sock, the_user->buf + the_user->buf_pos, BUFSIZ - the_user->buf_pos);
     printf("This many bytes were received: %zd\n", retval);
     
@@ -332,34 +337,55 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
         log_someone_out(the_user);
         return;
     }
+
+    if (retval > BUFSIZ) {
+        printf("retval too big, loggin' 'em out\n");
+        log_someone_out(the_user);
+        return;
+    }
     
     /*for (size_t i = 0; i < retval; i++) {
         printf("char of name: %.2hhx\n", (unsigned char) the_user->buf[i]); 
     }*/
-    the_user->buf_pos += retval;
-    response = websocket_analyze(the_user->buf, the_user->buf_pos);
-    printf("response status: %d\n", response.status);
-    printf("response length: %zu\n", response.length);
-    if (response.status == -1) {
+    size_t the_min = retval < the_user->buf_pos ? retval : the_user->buf_pos;
+    if (retval + the_user->buf_pos < the_min || retval + the_user->buf_pos > BUFSIZ) {
+        printf("Buffer full! kicking user %s, socket: %d\n", the_user->their_name, the_user->their_sock);
         log_someone_out(the_user);
         return;
-    } else if (response.status == 0) {
-        return;
     }
-    if (the_user->theyre_logged_in) {
-        wall_w_name(clients, response.start, response.length, max_clients, *the_user);
-        printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
-        the_user->buf_pos = 0;
-    } else {
-        printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
-
-        strncpy(the_user->their_name, response.start, response.payload_length);
-        the_user->their_name[response.length] = '\0';
+    the_user->buf_pos += retval;
         
-        the_user->theyre_logged_in = 1;
-        the_user->buf_pos = 0;
+    while (1) {
+        response = websocket_analyze(the_user->buf, the_user->buf_pos);
+        printf("response status: %d\n", response.status);
+        printf("response length: %zu\n", response.length);
+        printf("ORIGINAL buf_pos: %zu\n", the_user->buf_pos);
+        sleep(10);
+        if (response.status < 1) {
+            break;
+        }
+
+        if (the_user->theyre_logged_in) {
+            wall_w_name(clients, response.start, response.payload_length, max_clients, *the_user);
+            printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
+        } else {
+            printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
+
+            strncpy(the_user->their_name, response.start, response.payload_length);
+            the_user->their_name[response.payload_length] = '\0';
+            
+            the_user->theyre_logged_in = 1;
+        }
+        memmove(the_user->buf, the_user->buf + response.length, BUFSIZ - response.length);
+        printf("THE OLD buf_pos: %zu\n", the_user->buf_pos);
+        the_user->buf_pos -= response.length;
+        printf("THE NEW buf_pos: %zu\n", the_user->buf_pos);
+        exit(EXIT_FAILURE);
     }
-    return;
+    
+    if (response.status == -1) {
+        log_someone_out(the_user);
+    }
 }
 
 

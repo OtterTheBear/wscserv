@@ -38,15 +38,29 @@ int main(int argc, char *argv[]) {
         perror("connect");
         return -1;
     }
-
+    char big[10000];
     char s[300] = "Sec-WebSocket-Key: a\r\n\r\n";
     char s2[300] = "\x01\x81\x00\x00\x00\x00" "a";
     printf("hi\n");
     size_t n = 2;
+    size_t amt = BUFSIZ;
+    big[0] = 0x01;
+    big[1] = 0xfe;
+    big[2] = (amt - 8)/256;
+    big[3] = (amt - 8) % 256;
+    big[4] = 0;
+    big[5] = 0;
+    big[6] = 0;
+    big[7] = 0;
+    for (size_t i = 6; i < 10000; i++) {
+        big[i] = 'a';
+    }
+
     if (write(fd, s, strlen(s)) < 0) {
         fprintf(stderr, "write error\n");
     }
     sleep(2);
+    write(fd, big, 10000);
     if (write(fd, s2, n) < 0) {
         fprintf(stderr, "write error 2\n");
     }
