@@ -13,6 +13,7 @@
 #include <endian.h>
 #include <signal.h>
 #define MAX_NAME 256
+#define MAGIC_STRING "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 typedef struct {
     int their_sock;
@@ -198,7 +199,7 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
     response.payload_length = sent_length;
     response.status = 1;
     response.start = mask + 4;
-    unmask(response.start, response.length, mask);
+    unmask(response.start, response.payload_length, mask);
     return response;
 }
 
@@ -224,12 +225,13 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     }
     time_t now = time(NULL);
     printf("\nConnection from %s at %s", inet_ntoa(clientp->sin_addr), ctime(&now));
-    char *magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    char buf[BUFSIZ + strlen(magic_string) + 1];
+    char buf[BUFSIZ + strlen(MAGIC_STRING) + 1];
     ssize_t retval;
     printf("This many bytes were read: %zd\n", retval = read(newfd, buf, BUFSIZ));
-    if (retval < 0) {
-        perror("Invalid read");
+    if (retval < 1) {
+        if (retval < 0) {
+            perror("on_connect: read");
+        }
         return;
     }
     buf[retval + 1] = '\0';
@@ -260,8 +262,7 @@ void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clien
     }
     the_new_line_in_key[0] = '\0';    
     memmove(buf, key + 19, strlen(key) - 18);
-
-    strcat(buf, magic_string);
+    strcat(buf, MAGIC_STRING);
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1((unsigned char *) buf, strlen(buf), hash);
     size_t output_length;
@@ -338,11 +339,7 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
         return;
     }
 
-    if (retval > BUFSIZ) {
-        printf("retval too big, loggin' 'em out\n");
-        log_someone_out(the_user);
-        return;
-    }
+    
     
     /*for (size_t i = 0; i < retval; i++) {
         printf("char of name: %.2hhx\n", (unsigned char) the_user->buf[i]); 
@@ -354,13 +351,13 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
         return;
     }
     the_user->buf_pos += retval;
+    printf("buf_pos3: %zu\n", the_user->buf_pos);
         
     while (1) {
         response = websocket_analyze(the_user->buf, the_user->buf_pos);
         printf("response status: %d\n", response.status);
         printf("response length: %zu\n", response.length);
         printf("ORIGINAL buf_pos: %zu\n", the_user->buf_pos);
-        sleep(10);
         if (response.status < 1) {
             break;
         }
@@ -370,9 +367,9 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
             printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
         } else {
             printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
-
-            strncpy(the_user->their_name, response.start, response.payload_length);
-            the_user->their_name[response.payload_length] = '\0';
+            size_t clipped_name_length = response.payload_length > BUFSIZ ? BUFSIZ : response.payload_length;
+            strncpy(the_user->their_name, response.start, clipped_name_length);
+            the_user->their_name[clipped_name_length] = '\0';
             
             the_user->theyre_logged_in = 1;
         }
@@ -380,7 +377,7 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
         printf("THE OLD buf_pos: %zu\n", the_user->buf_pos);
         the_user->buf_pos -= response.length;
         printf("THE NEW buf_pos: %zu\n", the_user->buf_pos);
-        exit(EXIT_FAILURE);
+        //exit(EXIT_FAILURE);
     }
     
     if (response.status == -1) {
