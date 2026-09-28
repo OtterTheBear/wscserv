@@ -10,15 +10,27 @@
 #include <openssl/sha.h>
 #include <stdint.h>
 #include <errno.h>
+#ifdef __linux__
 #include <endian.h>
+#else
+#include <sys/endian.h>
+#endif
 #include <signal.h>
 #define MAX_NAME 256
 #define MAGIC_STRING "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define KEY_HEADER "Sec-WebSocket-Key: "
+#define WS_KEY_MIN_LEN (size_t) 24
+
+typedef enum {
+    PRE_HANDSHAKE,
+    POST_HANDSHAKE,
+    LOGGED_IN
+} ConnectionState;
 
 typedef struct {
     int their_sock;
     char their_name[BUFSIZ];
-    int theyre_logged_in;
+    ConnectionState state;
     char buf[BUFSIZ];
     size_t buf_pos; // index of the first unoccupied byte
 } user_t;
@@ -27,9 +39,24 @@ typedef struct {
     int status;
     size_t length;
     size_t payload_length;
-    char mask[4];
     char *start;
 } websocket_res_t;
+
+void printuser(user_t user) {
+    printf("user: %s, sock: %d, state: ", user.their_name, user.their_sock);
+    switch (user.state) {
+        case PRE_HANDSHAKE:
+            printf("PRE_HANDSHAKE");
+            break;
+        case POST_HANDSHAKE:
+            printf("POST_HANDSHAKE");
+            break;
+        case LOGGED_IN:
+            printf("LOGGED_IN");
+            break;
+    }
+    printf(", buf_pos: %zu\n", user.buf_pos);
+}
 
 // https://stackoverflow.com/questions/342409/how-do-i-base64-encode-decode-in-c
 static char encoding_table[] = {'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H',
@@ -73,6 +100,49 @@ char *base64_encode(const unsigned char *data,
     return encoded_data;
 }
 
+void unmask(char *buf, size_t length, char *mask) {
+    for (size_t i = 0; i < length; i++) {
+        buf[i] ^= mask[i % 4];
+    }
+}
+
+void reset_user_t(user_t *the_user) {
+    the_user->their_name[0] = '\0';
+    the_user->their_sock = -1;
+    the_user->state = PRE_HANDSHAKE;
+    the_user->buf_pos = 0;
+}
+
+void log_someone_out(user_t *the_user) { // reset the values of a user_t so onconnect will be able to use it again
+    close(the_user->their_sock);
+    reset_user_t(the_user);
+}
+
+int64_t websocket_send(int fd, char *buf, int64_t length, char opcode);
+
+void wall(user_t clients[], char *msg, int64_t length, uintmax_t max_clients) {
+    for (uintmax_t i = 0; i < max_clients; i++) {
+        if (clients[i].state == LOGGED_IN) {
+            if (clients[i].their_sock == 0) {
+                printf("what\n");
+                printf("%.*s\n", length > 128 ? 128 : (int) length, msg);
+            } else if (clients[i].their_sock > 0) {
+                if (websocket_send(clients[i].their_sock, msg, length, 0x81) < 0) {
+                    log_someone_out(&clients[i]);
+                }
+            }
+        }
+    }
+}
+
+void wall_w_name(user_t clients[], char *msg, size_t length, uintmax_t max_clients, user_t user) {
+    char msgstring[strlen(user.their_name) + length + 1 + 2];
+    strcpy(msgstring, user.their_name);
+    strcat(msgstring, ": ");
+    strncat(msgstring, msg, length);
+    wall(clients, msgstring, length + strlen(user.their_name) + 2, max_clients);
+}
+
 int64_t websocket_send(int fd, char *buf, int64_t length, char opcode) {
     char sendbuf[10];
     sendbuf[0] = opcode;
@@ -108,12 +178,6 @@ int64_t websocket_send(int fd, char *buf, int64_t length, char opcode) {
     return retval;
 }
 
-void unmask(char *buf, size_t length, char *mask) {
-    for (size_t i = 0; i < length; i++) {
-        buf[i] ^= mask[i % 4];
-    }
-}
-
 websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_length
     /* WebSocket frame types:
      * opcode (1), length (1), mask (4), message (length)
@@ -121,14 +185,11 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
      * opcode (1), length indicator (1, == 127), length (8, <= INT64_MAX), mask (4), message (length) */
     printf("length: %zu\n", length);
     printf("BUF\n");
-    size_t print_amount = length > 256 ? 256 : length;
     for (size_t i = 0; i < length; i++) {
         printf("%.2hhx ", buf[i]);
     }
-   /* if (length > print_amount) {
-        printf(" clipped\n");
-    }*/
     printf("\nEND BUF\n");
+
     websocket_res_t response;
     response.status = 0;
     if (length < 6) {
@@ -137,7 +198,7 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
         return response;
     }
 
-    printf("Opcode: %.2x\n", buf[0]);
+    printf("Opcode: %.2hhx\n", buf[0]);
     size_t sent_length;
     size_t next;
     if ((buf[1] & 0x80) == 0) {
@@ -168,7 +229,7 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
             return response;
         }
         int64_t sent_length64 = be64toh(*(int64_t*) (buf + 2));
-        if (sent_length64 > SIZE_MAX - 14 || sent_length64 < 0) {
+        if (sent_length64 < 0 || (uint64_t) sent_length64 > SIZE_MAX - 14) {
             printf("Invalid 64-bit length\n");
             response.status = -1;
             return response;
@@ -203,121 +264,78 @@ websocket_res_t websocket_analyze(char *buf, size_t length) { // length <= max_l
     return response;
 }
 
+websocket_res_t websocket_handshake_analyze(char *buf, size_t length) {
+    websocket_res_t response;
+    response.status = 0;
+    printf("REQUEST:\n");
+    write(STDOUT_FILENO, buf, length);
+    
+    char *end = memmem(buf, length, "\r\n\r\n", 4);
+    if (end == NULL) {
+        response.status = 0;
+        return response;
+    }
+    end[0] = '\0';
+    char *key = memmem(buf, length, KEY_HEADER, strlen(KEY_HEADER));
+    char *closemsg = "the key isn't in the request";
+    char *keytooshortmsg = "the key is too short";
+    //char *theresnonewlinemsg = "You forgot to put a new line";
+    
+    if (key == NULL) {
+        printf("%s\n", closemsg);
+        response.status = -1;
+        return response;
+    }
+    printf("goober\n");
+    //printf("key length: %zu\n", strlen(key));
+    
+    char *the_new_line_in_key = memmem(key, buf + length - key, "\r\n", 2);
+    printf("bbb\n");
+    if (the_new_line_in_key == NULL) {
+        printf("They forgot to put a new line\n");
+        response.status = -1;
+        return response;
+    }
+    printf("ccc\n");
 
-
-void reset_user_t(user_t *the_user) {
-    the_user->their_name[0] = '\0';
-    the_user->their_sock = -1;
-    the_user->theyre_logged_in = 0;
-    the_user->buf_pos = 0;
+    if (the_new_line_in_key - key < (ptrdiff_t) (strlen(KEY_HEADER) + WS_KEY_MIN_LEN)) {
+        printf("%s\n", keytooshortmsg);
+        response.status = -1;
+        return response;
+    }
+    response.start = key + strlen(KEY_HEADER);
+    response.payload_length = the_new_line_in_key - response.start;
+    response.length = end - buf + 4;
+    printf("true response.length: %zu\n", response.length);
+    response.status = 1;
+    printf("aaaaaaaaresponse.length: %zu\n", response.length);
+    return response;
 }
-
-void log_someone_out(user_t *the_user) { // reset the values of a user_t so onconnect will be able to use it again
-    close(the_user->their_sock);
-    reset_user_t(the_user);
-}
-
 
 void on_connect(int fd, struct sockaddr_in *clientp, socklen_t *cp, user_t clients[], uintmax_t max_clients) {
     int newfd = accept(fd, (struct sockaddr *) clientp, cp);
     if (newfd < 0) {
+        perror("accept");
         return;
     }
     time_t now = time(NULL);
     printf("\nConnection from %s at %s", inet_ntoa(clientp->sin_addr), ctime(&now));
-    char buf[BUFSIZ + strlen(MAGIC_STRING) + 1];
-    ssize_t retval;
-    printf("This many bytes were read: %zd\n", retval = read(newfd, buf, BUFSIZ));
-    if (retval < 1) {
-        if (retval < 0) {
-            perror("on_connect: read");
-        }
-        return;
-    }
-    buf[retval + 1] = '\0';
-    char *key = strstr(buf, "Sec-WebSocket-Key: ");
-    char *closemsg = "the key isn't in the request";
-    char *keytooshortmsg = "the key is too short";
-    char *theresnonewlinemsg = "You forgot to put a new line";
-    if (key == NULL) {
-        printf("%s\n", closemsg);
-        websocket_send(newfd, closemsg, strlen(closemsg), 0x81);
-        close(newfd);
-        return;
-    }
-    
-    printf("key length: %zu\n", strlen(key));
-    if (strlen(key) <= 23) {
-        printf("%s\n", keytooshortmsg);
-        websocket_send(newfd, keytooshortmsg, strlen(keytooshortmsg), 0x81);
-        close(newfd);
-        return;
-    }
-    char *the_new_line_in_key = strstr(key, "\r\n");
-    if (the_new_line_in_key == NULL) {
-        printf("They forgot to put a new line\n");
-        websocket_send(newfd, theresnonewlinemsg, strlen(theresnonewlinemsg), 0x81);
-        close(newfd);
-        return;
-    }
-    the_new_line_in_key[0] = '\0';    
-    memmove(buf, key + 19, strlen(key) - 18);
-    strcat(buf, MAGIC_STRING);
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1((unsigned char *) buf, strlen(buf), hash);
-    size_t output_length;
-    char *the_base64_key = base64_encode(hash, SHA_DIGEST_LENGTH, &output_length);
-
-    if (the_base64_key == NULL) {
-        printf("Base64-encoded key was null\n");
-        close(newfd);
-        return;
-    }
-
-    char response[1004 + output_length];
-    strcpy(response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
-    strcat(strcat(response, the_base64_key), "\r\n\r\n");
-    free(the_base64_key);
-    write(newfd, response, strlen(response));
     for (uintmax_t i = 0; i < max_clients; i++) {
         if (clients[i].their_sock < 0) {
             clients[i].their_sock = newfd;
             return;
         }
     }
-    char *sorryfullmsg = "Sorry, the server seems to be full right now.";
-    websocket_send(newfd, sorryfullmsg, strlen(sorryfullmsg), 0x81);
-    close(newfd);
-    
+    printf("Sorry, the server seems to be full right now.");
 }
 
-void wall(user_t clients[], char *msg, int64_t length, uintmax_t max_clients) {
-    for (uintmax_t i = 0; i < max_clients; i++) {
-        if (clients[i].theyre_logged_in) {
-            if (clients[i].their_sock == 0) {
-                printf("what\n");
-                printf("%.*s\n", length > 128 ? 128 : (int) length, msg);
-            } else if (clients[i].their_sock > 0) {
-                if (websocket_send(clients[i].their_sock, msg, length, 0x81) < 0) {
-                    log_someone_out(&clients[i]);
-                }
-            }
-        }
-    }
-}
 
-void wall_w_name(user_t clients[], char *msg, size_t length, uintmax_t max_clients, user_t user) {
-    char msgstring[strlen(user.their_name) + length + 1 + 2];
-    strcpy(msgstring, user.their_name);
-    strcat(msgstring, ": ");
-    strncat(msgstring, msg, length);
-    wall(clients, msgstring, length + strlen(user.their_name) + 2, max_clients);
-}
 
 void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     ssize_t retval;
     websocket_res_t response;
-    printf("\nfrom %s, socket: %d, logged in?: %d\n", the_user->their_name, the_user->their_sock, the_user->theyre_logged_in);
+    printf("Received data from ");
+    printuser(*the_user);
     if (the_user->their_sock == 0) {
         retval = read(the_user->their_sock, the_user->buf, BUFSIZ);
         if (retval <= 0) {
@@ -344,7 +362,7 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     /*for (size_t i = 0; i < retval; i++) {
         printf("char of name: %.2hhx\n", (unsigned char) the_user->buf[i]); 
     }*/
-    size_t the_min = retval < the_user->buf_pos ? retval : the_user->buf_pos;
+    size_t the_min = (size_t) retval < the_user->buf_pos ? retval : the_user->buf_pos;
     if (retval + the_user->buf_pos < the_min || retval + the_user->buf_pos > BUFSIZ) {
         printf("Buffer full! kicking user %s, socket: %d\n", the_user->their_name, the_user->their_sock);
         log_someone_out(the_user);
@@ -354,39 +372,81 @@ void on_data(user_t clients[], user_t *the_user, uintmax_t max_clients) {
     printf("buf_pos3: %zu\n", the_user->buf_pos);
         
     while (1) {
-        response = websocket_analyze(the_user->buf, the_user->buf_pos);
-        printf("response status: %d\n", response.status);
-        printf("response length: %zu\n", response.length);
-        printf("ORIGINAL buf_pos: %zu\n", the_user->buf_pos);
-        if (response.status < 1) {
-            break;
-        }
+        printf("pos of buf: %zu\n", the_user->buf_pos);
+        if (the_user->state == POST_HANDSHAKE || the_user->state == LOGGED_IN) {
+            response = websocket_analyze(the_user->buf, the_user->buf_pos);
+            printf("response status: %d\n", response.status);
+            printf("response length: %zu\n", response.length);
+            printf("ORIGINAL buf_pos: %zu\n", the_user->buf_pos);
+            if (response.status < 1) {
+                break;
+            }
 
-        if (the_user->theyre_logged_in) {
-            wall_w_name(clients, response.start, response.payload_length, max_clients, *the_user);
-            printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
-        } else {
-            printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
-            size_t clipped_name_length = response.payload_length > BUFSIZ ? BUFSIZ : response.payload_length;
-            strncpy(the_user->their_name, response.start, clipped_name_length);
-            the_user->their_name[clipped_name_length] = '\0';
+            if (the_user->state == LOGGED_IN) {
+                wall_w_name(clients, response.start, response.payload_length, max_clients, *the_user);
+                printf("This is the sum: %zu\n", strlen(the_user->their_name) + 2 + response.payload_length);
+            } else {
+                printf("Here's how many bytes they sent if they're not logged in: %zd\n", retval);
+                size_t clipped_name_length = response.payload_length > BUFSIZ ? BUFSIZ : response.payload_length;
+                strncpy(the_user->their_name, response.start, clipped_name_length);
+                the_user->their_name[clipped_name_length] = '\0';
+                
+                the_user->state = LOGGED_IN;
+            }
+        } else if (the_user->state == PRE_HANDSHAKE) {
+            response = websocket_handshake_analyze(the_user->buf, the_user->buf_pos);
+            printf("PRE response length: %zu\n", response.length);
+            printf("also payload length: %zu\n", response.payload_length);
+            if (response.status < 1) {
+                break;
+            }
+
+            write(STDOUT_FILENO, response.start, response.payload_length);
+            size_t concatenated_length = response.payload_length + strlen(MAGIC_STRING);
+            char *concatenated = malloc(concatenated_length);
+            if (concatenated == NULL) {
+                perror("malloc");
+                exit(EXIT_FAILURE);
+            }
             
-            the_user->theyre_logged_in = 1;
+            memcpy(concatenated, response.start, response.payload_length);
+            memcpy(concatenated + response.payload_length, MAGIC_STRING, strlen(MAGIC_STRING));
+            unsigned char hash[SHA_DIGEST_LENGTH];
+            SHA1((unsigned char *) concatenated, concatenated_length, hash);
+            free(concatenated);
+            size_t base64_hash_length;
+            char *the_base64_key = base64_encode(hash, SHA_DIGEST_LENGTH, &base64_hash_length);
+
+            if (the_base64_key == NULL) {
+                printf("Base64-encoded key was null\n");
+                log_someone_out(the_user);
+                return;
+            }
+            
+            char http_response[1004 + base64_hash_length];
+            strcpy(http_response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+            strcat(strcat(http_response, the_base64_key), "\r\n\r\n");
+            free(the_base64_key);
+            printf("HTTP RESPONSE: %s\n", http_response);
+            write(the_user->their_sock, http_response, strlen(http_response));
+            the_user->state = POST_HANDSHAKE;
+            printf("what about here? response.length: %zu\n", response.length);
         }
+        printf("fake response.length: %zu\n", response.length);
         memmove(the_user->buf, the_user->buf + response.length, BUFSIZ - response.length);
         printf("THE OLD buf_pos: %zu\n", the_user->buf_pos);
         the_user->buf_pos -= response.length;
         printf("THE NEW buf_pos: %zu\n", the_user->buf_pos);
-        //exit(EXIT_FAILURE);
     }
-    
     if (response.status == -1) {
         log_someone_out(the_user);
+        if (the_user->state == PRE_HANDSHAKE) {
+            printf("logged out prehandshake\n");
+        } else {
+            printf("logged out post handshake\n");
+        }
     }
 }
-
-
-
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -426,12 +486,13 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     user_t clients[max_clients];
+    
     for (uintmax_t i = 0; i < max_clients; i++) {
         reset_user_t(&clients[i]);
     }
     strcpy(clients[0].their_name, "Server");
     clients[0].their_sock = 0;
-    clients[0].theyre_logged_in = 1;
+    clients[0].state = LOGGED_IN;
     
     struct timespec t1, t2;
     t1.tv_sec = 0;
@@ -454,7 +515,8 @@ int main(int argc, char *argv[]) {
         uintmax_t user_count = 0;
         for (uintmax_t i = 0; i < max_clients; i++) {
             if (clients[i].their_sock > -1) {
-                printf("%ju: their_sock: %d, their_name: %s, theyre_logged_in: %d\n", i, clients[i].their_sock, clients[i].their_name, clients[i].theyre_logged_in);
+                printf("%ju: ", i);
+                printuser(clients[i]);
                 FD_SET(clients[i].their_sock, &readfds);
                 user_count++;
             }
